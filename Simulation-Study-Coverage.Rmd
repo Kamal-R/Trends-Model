@@ -1,0 +1,664 @@
+---
+title: "Simulation-Study-Coverage"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(here)
+library(tools)
+library(magrittr)
+
+library(tidyverse)
+library(cgwtools)
+library(foreach)
+library(INLA)
+library(brinla)
+library(logspline)
+library(KernSmooth)
+library(sn)
+library(xtable)
+
+library(Rcpp)
+library(scales)
+require(RColorBrewer)
+library(knitr)
+library(kableExtra)
+library(GET)
+library(tikzDevice) 
+library(bayestestR)
+
+blue_color <- rgb(red = 57, green = 106, blue = 177, max = 255) 
+red_color <- rgb(red = 220, green = 20, blue = 60, max = 255) 
+green_color <- rgb(red = 62, green = 150, blue = 81, max = 255)
+
+sourceCpp("Momentum.cpp", rebuild = TRUE )
+source("Simulation-Study-Helper-Functions.R")
+inla.setOption(inla.mode = "experimental") 
+# inla.setOption(pardiso.license = "../pardiso.lic")
+set.seed(1800)
+```
+
+<!-- This file contains code that calculates the coverage probabilities for each of the 6 simulation study scenarios. -->
+
+```{r Calculate-Coverage-Const}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("Sim_Data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  const_rw_model <- fit_RW2_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.001,
+                                  h_val = 0.001 ) 
+  
+  posterior_sample <- posterior_sample_function( const_rw_model )
+  const_Momentum <- sample_posterior_momentum( const_rw_model ) 
+  const_Stability <- density_sigma( const_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( const_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( const_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( const_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( const_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum( 1, 6210, as.matrix(rep(0,6210)) ),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd( (rep(0,6210)) ),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+
+
+
+
+```{r Calculate-Coverage-Logistic}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("sim_data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  logistic_rw_model <- fit_RW2_model( response = mortality_logistic, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.001,
+                                  h_val = 0.001 ) 
+  
+  posterior_sample <- posterior_sample_function( logistic_rw_model )
+  logistic_Momentum <- sample_posterior_momentum( logistic_rw_model ) 
+  logistic_Stability <- density_sigma( logistic_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( logistic_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( logistic_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( logistic_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( logistic_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum(1, 6210, as.matrix(random_effects$gamma_logistic)),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd(random_effects$gamma_logistic),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+
+
+
+```{r Calculate-Coverage-Quad}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("sim_data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  quad_rw_model <- fit_RW2_model( response = mortality_quad, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.01,
+                                  h_val = 0.001 ) 
+  
+  posterior_sample <- posterior_sample_function( quad_rw_model )
+  quad_Momentum <- sample_posterior_momentum( quad_rw_model ) 
+  quad_Stability <- density_sigma( quad_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( quad_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( quad_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( quad_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( quad_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum(1, 6210, as.matrix(random_effects$gamma_quad)),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd(random_effects$gamma_quad),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+
+
+```{r Calculate-Coverage-Skew}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("sim_data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  skew_rw_model <- fit_RW2_model( response = mortality_skew, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.001,
+                                  h_val = 0.005 ) 
+  
+  posterior_sample <- posterior_sample_function( skew_rw_model )
+  skew_Momentum <- sample_posterior_momentum( skew_rw_model ) 
+  skew_Stability <- density_sigma( skew_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( skew_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( skew_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( skew_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( skew_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum(1, 6210, as.matrix(random_effects$gamma_skew)),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd(random_effects$gamma_skew),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+
+
+```{r Calculate-Coverage-Cubic}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("sim_data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  cubic_rw_model <- fit_RW2_model( response = mortality_cubic, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.001,
+                                  h_val = 0.025 ) 
+  
+  posterior_sample <- posterior_sample_function( cubic_rw_model )
+  cubic_Momentum <- sample_posterior_momentum( cubic_rw_model ) 
+  cubic_Stability <- density_sigma( cubic_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( cubic_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( cubic_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( cubic_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( cubic_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum(1, 6210, as.matrix(random_effects$gamma_cubic)),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd(random_effects$gamma_cubic),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+
+
+```{r Calculate-Coverage-Step}
+posterior_samples_momentum_CI <- matrix(NA, nrow = 50, ncol = 2)
+posterior_samples_sigma_CI <- matrix(NA, nrow = 50, ncol = 2)
+
+
+for (ii in 1:50) {
+  
+  set.seed(ii * 100)
+
+  # Load and process circulatory mortality data 
+  sim_data <- readRDS("sim_data_O3_Temp.RDS")
+  num_obs <- 1:length(sim_data$Date)
+  
+  dow <- factor(weekdays(sim_data$Date), levels = 
+                  weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                       format(sim_data$Date[1], "%m"),
+                                       format(sim_data$Date[1], "%d")), 
+                               len=7, by='days')))
+  
+  year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+  year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+    min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+  
+  X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+  # Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+  S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+              sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+  
+  ### Temperature arguments for INLA
+  temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+    min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+  temp_bins <- seq( from = min( temp_values ), 
+                    to = max( temp_values ),
+                    by = 1 )
+  
+  ### Pollutant effect is the 1-day lagged O3 value
+  pollutant <- sim_data$kO3.8hmx.lag1
+  ### Temperature is the 0-day lagged temperature
+  temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+  
+  ### Day constraint -- daily observations
+  day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+  day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+  day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+  if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+  day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+  day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+  
+  ### Data to input into INLA
+  daily_time <- 1:length(num_obs)
+  daily_iid <- 1:length(num_obs)
+  
+  ### Temperature constraint
+  constraint_temp <- 18
+  temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+  temp_constraint[which( temp_bins == constraint_temp - 
+                           min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+  # Generate simulated data
+  fixed_effects <- set_fixed_effects()
+  random_effects <- set_random_effects() 
+
+  # Prepare INLA models
+  sim_data_for_INLA <- sim_data_INLA()
+  
+  dummy_model <- fit_dummy_model( response = mortality_const, 
+                                  city_data = sim_data_for_INLA )
+
+  step_rw_model <- fit_RW2_model( response = mortality_step, 
+                                  city_data = sim_data_for_INLA,
+                                  day_constraint = day_constraint, 
+                                  temp_constraint = temp_constraint,
+                                  step_factor = 0.10, step_len = 0.001,
+                                  h_val = 0.001 ) 
+  
+  posterior_sample <- posterior_sample_function( step_rw_model )
+  step_Momentum <- sample_posterior_momentum( step_rw_model ) 
+  step_Stability <- density_sigma( step_rw_model )
+  
+  posterior_samples_momentum_CI[ii,1] <- quantile( step_Momentum, probs = 0.025)
+  posterior_samples_momentum_CI[ii,2] <- quantile( step_Momentum, probs = 0.975)
+  
+  posterior_samples_sigma_CI[ii,1] <- quantile( step_Stability, probs = 0.025)
+  posterior_samples_sigma_CI[ii,2] <- quantile( step_Stability, probs = 0.975)
+}
+
+momentum_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { momentum_coverage[jj] <- between( Momentum(1, 6210, as.matrix(random_effects$gamma_step)),
+                                                       posterior_samples_momentum_CI[jj,1],
+                                                       posterior_samples_momentum_CI[jj,2] ) }
+sum( momentum_coverage ) / 50
+
+
+sigma_coverage <- vector( length = 50 )
+for ( jj in 1:50 ) { sigma_coverage[jj] <- between( sd(random_effects$gamma_step),
+                                                    posterior_samples_sigma_CI[jj,1],
+                                                    posterior_samples_sigma_CI[jj,2] ) }
+sum( sigma_coverage ) / 50
+```
+

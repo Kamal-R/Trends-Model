@@ -1,0 +1,582 @@
+---
+title: "Run Simulation Studies: 2nd-Order Random Walk"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(here)
+library(tools)
+library(magrittr)
+
+library(tidyverse)
+library(cgwtools)
+library(foreach)
+library(INLA)
+library(brinla)
+library(logspline)
+library(KernSmooth)
+library(sn)
+library(xtable)
+
+library(Rcpp)
+library(scales)
+require(RColorBrewer)
+library(knitr)
+library(kableExtra)
+library(GET)
+library(tikzDevice) 
+library(bayestestR)
+
+blue_color <- rgb(red = 57, green = 106, blue = 177, max = 255) 
+red_color <- rgb(red = 220, green = 20, blue = 60, max = 255) 
+green_color <- rgb(red = 62, green = 150, blue = 81, max = 255)
+
+sourceCpp("Momentum.cpp", rebuild = TRUE )
+source("Simulation-Study-Helper-Functions.R")
+# inla.setOption(inla.mode = "experimental") 
+# inla.setOption(pardiso.license = "../pardiso.lic")
+set.seed(1800)
+```
+
+<!-- This file contains code that calculates the simulation study results, except for the coverage probabilities of each scenario. -->
+
+```{r Simulate-Date-Seed-1800}
+
+# Load and process circulatory mortality data 
+sim_data <- readRDS("Sim_Data_O3_Temp.RDS")
+num_obs <- 1:length(sim_data$Date)
+
+dow <- factor(weekdays(sim_data$Date), levels = 
+                weekdays(seq(ISOdate(format(sim_data$Date[1], "%Y"),
+                                     format(sim_data$Date[1], "%m"),
+                                     format(sim_data$Date[1], "%d")), 
+                             len=7, by='days')))
+
+year <-  as.numeric(format(sim_data$Date,'%Y')) # for fixed effect model
+year_count <- as.numeric( format( sim_data$Date, format = "%Y" ) ) -
+  min( as.numeric( format( sim_data$Date, format = "%Y" ) ) ) + 1 
+
+X <- model.matrix(~ as.factor(dow)) # dow == 1 is the baseline 
+# Seasonal effects matrix [Columns = cos12, cos6, sin12, sin6]
+S <- cbind( cos(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+            cos(2 * pi * 1:length(sim_data$Date) / 182.625 ), 
+            sin(2 * pi * 1:length(sim_data$Date) / 365.25 ), 
+            sin(2 * pi * 1:length(sim_data$Date) / 182.625 ) )
+
+### Temperature arguments for INLA
+temp_values <- round( sim_data$kTemp.24hm.lag0 ) - 
+  min( round( sim_data$kTemp.24hm.lag0 ) ) + 1
+temp_bins <- seq( from = min( temp_values ), 
+                  to = max( temp_values ),
+                  by = 1 )
+
+### Pollutant effect is the 1-day lagged O3 value
+pollutant <- sim_data$kO3.8hmx.lag1
+### Temperature is the 0-day lagged temperature
+temperature <- round( sim_data$kTemp.24hm.lag0, 0 )
+
+### Day constraint -- daily observations
+day_range <- c( min( sim_data$Date ), max( sim_data$Date ) )  
+day_seq <- seq( from = day_range[1], to = day_range[2], by = 1 )
+day_constraint_date <- day_seq[ floor( length( day_seq ) / 2 ) - 3 ] # Place constraint on middle Monday
+if ( weekdays(day_constraint_date) != "Monday" ) stop( "Pollutant random walk constraint is not on Monday." )
+day_constraint <- as.numeric( vector( length = length(sim_data$Date) ) )
+day_constraint[which( sim_data$Date == day_constraint_date )] <- 1
+
+### Data to input into INLA
+daily_time <- 1:length(num_obs)
+daily_iid <- 1:length(num_obs)
+
+### Temperature constraint
+constraint_temp <- 18
+temp_constraint <- as.numeric( vector( length = length(temp_bins) ) )
+temp_constraint[which( temp_bins == constraint_temp - 
+                         min( round( sim_data$kTemp.24hm.lag0 ) ) + 1 )] <- 1
+
+# Generate simulated data
+fixed_effects <- set_fixed_effects()
+random_effects <- set_random_effects() 
+
+# Prepare INLA models
+sim_data_for_INLA <- sim_data_INLA()
+
+dummy_model <- fit_dummy_model( response = mortality_const, 
+                                city_data = sim_data_for_INLA )
+```
+
+```{r Run-INLA-Models-Random-Walk, message = FALSE, warning = FALSE}
+### First simulation study
+const_rw_model <- fit_RW2_model( response = mortality_const, 
+                                 city_data = sim_data_for_INLA,
+                                 day_constraint = day_constraint, 
+                                 temp_constraint = temp_constraint,
+                                 step_factor = 0.10, step_len = 0.001,
+                                 h_val = 0.001 ) 
+logistic_rw_model <- fit_RW2_model( response = mortality_logistic, 
+                                    city_data = sim_data_for_INLA,
+                                    day_constraint = day_constraint, 
+                                    temp_constraint = temp_constraint,
+                                    step_factor = 0.10, step_len = 0.001,
+                                    h_val = 0.001 ) 
+quad_rw_model <- fit_RW2_model( response = mortality_quad, 
+                                city_data = sim_data_for_INLA,
+                                day_constraint = day_constraint, 
+                                temp_constraint = temp_constraint,
+                                step_factor = 0.10, step_len = 0.01,
+                                h_val = 0.001 ) 
+
+### Second simulation study
+skew_rw_model <- fit_RW2_model( response = mortality_skew, 
+                                city_data = sim_data_for_INLA,                                 
+                                day_constraint = day_constraint, 
+                                temp_constraint = temp_constraint,
+                                step_factor = 0.10, step_len = 0.001 ) 
+cubic_rw_model <- fit_RW2_model( response = mortality_cubic, 
+                                 city_data = sim_data_for_INLA,
+                                 day_constraint = day_constraint, 
+                                 temp_constraint = temp_constraint,
+                                 step_factor = 0.10, step_len = 0.001,
+                                 h_val = 0.025 ) 
+step_rw_model <- fit_RW2_model( response = mortality_step, 
+                                city_data = sim_data_for_INLA,
+                                day_constraint = day_constraint, 
+                                temp_constraint = temp_constraint,
+                                step_factor = 0.10, step_len = 0.001,
+                                h_val = 0.001 ) 
+```
+
+```{r Run-INLA-Models-Fixed-Effects}
+### First simulation study
+const_annual_model <- fit_FE_model( response = mortality_const, 
+                                    city_data = sim_data_for_INLA,                                 
+                                    day_constraint = day_constraint, 
+                                    temp_constraint = temp_constraint,
+                                    step_factor = 0.10, step_len = 0.001 ) 
+logistic_annual_model <- fit_FE_model( response = mortality_logistic, 
+                                       city_data = sim_data_for_INLA,
+                                       day_constraint = day_constraint, 
+                                       temp_constraint = temp_constraint,
+                                       step_factor = 0.10, step_len = 0.001 )
+quad_annual_model <- fit_FE_model( response = mortality_quad, 
+                                   city_data = sim_data_for_INLA,                                 
+                                   day_constraint = day_constraint, 
+                                   temp_constraint = temp_constraint,
+                                   step_factor = 0.10, step_len = 0.001 )
+
+### Second simulation study
+skew_annual_model <- fit_FE_model( response = mortality_skew, 
+                                   city_data = sim_data_for_INLA,                                 
+                                   day_constraint = day_constraint, 
+                                   temp_constraint = temp_constraint,
+                                   step_factor = 0.10, step_len = 0.001 ) 
+cubic_annual_model <- fit_FE_model( response = mortality_cubic, 
+                                    city_data = sim_data_for_INLA,                                 
+                                    day_constraint = day_constraint, 
+                                    temp_constraint = temp_constraint,
+                                    step_factor = 0.10, step_len = 0.001 )
+step_annual_model <- fit_FE_model( response = mortality_step, 
+                                   city_data = sim_data_for_INLA,
+                                   day_constraint = day_constraint, 
+                                   temp_constraint = temp_constraint,
+                                   step_factor = 0.10, step_len = 0.001 )
+```
+
+
+
+```{r Check-Hyperparameters, eval = FALSE}
+brinla::bri.hyperpar.summary( const_rw_model )
+brinla::bri.hyperpar.summary( logistic_rw_model )
+brinla::bri.hyperpar.summary( quad_rw_model )
+brinla::bri.hyperpar.summary( skew_rw_model )
+brinla::bri.hyperpar.summary( cubic_rw_model )
+brinla::bri.hyperpar.summary( step_rw_model )
+
+brinla::bri.hyperpar.summary( const_annual_model )
+brinla::bri.hyperpar.summary( logistic_annual_model )
+brinla::bri.hyperpar.summary( quad_annual_model )
+brinla::bri.hyperpar.summary( skew_annual_model )
+brinla::bri.hyperpar.summary( cubic_annual_model )
+brinla::bri.hyperpar.summary( step_annual_model )
+```
+
+
+```{r Plot-Gamma-Random-Walk-Model}
+## First simulation study
+posterior_sample <- posterior_sample_function(const_rw_model)
+tikz(file = "Figures/Const_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = const_rw_model, 
+                       sim_const = TRUE, full_legend = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[5] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Const_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+posterior_sample <- posterior_sample_function(logistic_rw_model)
+tikz(file = "Figures/Logistic_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = logistic_rw_model, 
+                       sim_logistic = TRUE, legend_mean_only = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[6] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Logistic_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+posterior_sample <- posterior_sample_function(quad_rw_model)
+tikz(file = "Figures/Quad_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = quad_rw_model, 
+                       sim_quad = TRUE, legend_mean_only = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[7] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Quad_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+
+### Second simulation study
+posterior_sample <- posterior_sample_function(skew_rw_model)
+tikz(file = "Figures/Skew_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = skew_rw_model, 
+                       sim_skew = TRUE, full_legend = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[5] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Skew_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+posterior_sample <- posterior_sample_function(cubic_rw_model)
+tikz(file = "Figures/Cubic_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = cubic_rw_model, 
+                       sim_cubic = TRUE, legend_mean_only = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[6] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Cubic_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+posterior_sample <- posterior_sample_function(step_rw_model)
+tikz(file = "Figures/Step_Gamma_RW2_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_RW( INLA_model = step_rw_model, 
+                       sim_step = TRUE, legend_mean_only = TRUE,
+                       mean_color = brewer.pal(n = 8, name = "Dark2")[7] )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Step_Gamma_RW2_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+```
+
+
+```{r Plot-Gamma-Fixed-Effects-Model}
+### First simulation study
+tikz(file = "Figures/Const_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = const_annual_model, 
+                           sim_const = TRUE, full_legend = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Const_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Logistic_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = logistic_annual_model, 
+                           sim_logistic = TRUE, legend_mean_only = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Logistic_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Quad_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = quad_annual_model , 
+                           sim_quad = TRUE, legend_mean_only = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Quad_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+
+
+### Second simulation study
+tikz(file = "Figures/Skew_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = skew_annual_model, 
+                           sim_skew = TRUE, full_legend = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Skew_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Cubic_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = cubic_annual_model, 
+                           sim_cubic = TRUE, legend_mean_only = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Cubic_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Step_Gamma_FE_2.tex", width = 4, height = 3,
+     standAlone = TRUE, timestamp = TRUE)
+plot_Gamma_lincomb_annual( INLA_fixedeffects_model = step_annual_model , 
+                           sim_step = TRUE, legend_mean_only = TRUE,
+                           lincomb_bool = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Step_Gamma_FE_2.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+```
+
+
+
+```{r Momentum-and-Stability-Tables}
+posterior_sample <- posterior_sample_function( const_rw_model )
+Const_Momentum <- sample_posterior_momentum( const_rw_model ) 
+Const_Sigma_Summary <- as.vector( Stability_Summary( const_rw_model ) )
+Const_Momentum_Summary <- as.vector( sim_table_mk( Const_Momentum ) ) 
+
+posterior_sample <- posterior_sample_function( logistic_rw_model )
+Logistic_Momentum <- sample_posterior_momentum( logistic_rw_model )
+Logistic_Sigma_Summary <- as.vector( Stability_Summary( logistic_rw_model ) )
+Logistic_Momentum_Summary <- as.vector( sim_table_mk( Logistic_Momentum ) ) 
+
+posterior_sample <- posterior_sample_function( quad_rw_model )
+Quad_Momentum <- sample_posterior_momentum( quad_rw_model )
+Quad_Sigma_Summary <- as.vector( Stability_Summary( quad_rw_model ) )
+Quad_Momentum_Summary <- as.vector( sim_table_mk( Quad_Momentum ) ) 
+
+posterior_sample <- posterior_sample_function( skew_rw_model )
+Skew_Momentum <- sample_posterior_momentum( skew_rw_model ) 
+Skew_Sigma_Summary <- as.vector( Stability_Summary( skew_rw_model ) )
+Skew_Momentum_Summary <- as.vector( sim_table_mk( Skew_Momentum ) ) 
+
+posterior_sample <- posterior_sample_function( cubic_rw_model )
+Cubic_Momentum <- sample_posterior_momentum( cubic_rw_model )
+Cubic_Sigma_Summary <- as.vector( Stability_Summary( cubic_rw_model ) )
+Cubic_Momentum_Summary <- as.vector( sim_table_mk( Cubic_Momentum ) ) 
+
+posterior_sample <- posterior_sample_function( step_rw_model )
+Step_Momentum <- sample_posterior_momentum( step_rw_model )
+Step_Sigma_Summary <- as.vector( Stability_Summary( step_rw_model ) )
+Step_Momentum_Summary <- as.vector( sim_table_mk( Step_Momentum ) ) 
+
+
+Momentum_Column <- rbind( table_entry_momentum( Const_Momentum_Summary ), 
+                          table_entry_momentum( Logistic_Momentum_Summary ), 
+                          table_entry_momentum( Quad_Momentum_Summary ), 
+                          table_entry_momentum( Skew_Momentum_Summary ),
+                          table_entry_momentum( Cubic_Momentum_Summary ), 
+                          table_entry_momentum( Step_Momentum_Summary ) )
+
+Stability_Column <- rbind( table_entry_stability( Const_Sigma_Summary ), 
+                           table_entry_stability( Logistic_Sigma_Summary ), 
+                           table_entry_stability( Quad_Sigma_Summary ),
+                           table_entry_stability( Skew_Sigma_Summary ), 
+                           table_entry_stability( Cubic_Sigma_Summary ), 
+                           table_entry_stability( Step_Sigma_Summary ) ) 
+
+Row_names <- c( "Scenario 1", "Scenario 2", "Scenario 3", 
+                "Scenario 4", "Scenario 5", "Scenario 6" )
+simTable <- tibble ( Row_names, Momentum_Column, Stability_Column )
+names(simTable) <- c( "", "Momentum", "Stability")
+
+knitr::kable( simTable, booktabs = TRUE, longtable = TRUE, format = "latex", escape = FALSE,
+              caption = "Estimated momentum and stability when the air pollution effect is 
+              simulated as a constant, logistic, quadratic, skewed, cubic, or step function.",
+              label = "Sim-Study-Summary-Table" ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r Plot-Momentum-and-Stability}
+### First simulation study
+tikz(file = "Figures/Momentum_SimStudy_10.tex", width = 4, height = 3, 
+     standAlone = TRUE, timestamp = TRUE)
+plot_posterior_momentum( Const_Momentum, Logistic_Momentum, Quad_Momentum, 
+                         legend_position = "topleft", legend_include = TRUE,
+                         legend_size = 1, offset = 0, first_simStudy = TRUE )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Momentum_SimStudy_10.tex", clean = TRUE, 
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Stability_SimStudy_10.tex", width = 4, height = 3, 
+     standAlone = TRUE, timestamp = TRUE)
+plot_posterior_sigma( const_rw_model, logistic_rw_model, quad_rw_model, 
+                      legend_position = "top", legend_include = FALSE,
+                      legend_size = 1, x_min = 0, x_max = 0.045, offset = 200 )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Stability_SimStudy_10.tex", clean = TRUE,
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+
+
+### Second simulation study
+tikz(file = "Figures/Momentum_SimStudy_30.tex", width = 4, height = 3, 
+     standAlone = TRUE, timestamp = TRUE)
+plot_posterior_momentum( Skew_Momentum, Cubic_Momentum, Step_Momentum, 
+                         legend_position = "topleft", legend_include = TRUE,
+                         legend_size = 1, offset = 5, first_simStudy = FALSE,
+                         set_bandwith = 0.05 )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Momentum_SimStudy_30.tex", clean = TRUE, 
+  emulation = TRUE, engine_args = '-shell-escape') )
+
+tikz(file = "Figures/Stability_SimStudy_30.tex", width = 4, height = 3, 
+     standAlone = TRUE, timestamp = TRUE)
+plot_posterior_sigma( skew_rw_model, cubic_rw_model, step_rw_model, 
+                      legend_position = "topleft", legend_include = FALSE,
+                      legend_size = 1, x_min = 0.0075, x_max = 0.0175, offset = 10 )
+dev.off()
+invisible( tinytex::latexmk(
+  file = "Figures/Stability_SimStudy_30.tex", clean = TRUE, 
+  emulation = TRUE, engine_args = '-shell-escape') )
+```
+
+
+
+```{r Table-SimStudy-Appendix-Random-Walk-1}
+const_fe <- fixed_effects_summary( const_rw_model )
+const_re <- random_effects_summary( const_rw_model )
+logistic_fe <- fixed_effects_summary( logistic_rw_model )
+logistic_re <- random_effects_summary( logistic_rw_model )
+quad_fe <- fixed_effects_summary( quad_rw_model )
+quad_re <- random_effects_summary( quad_rw_model )
+
+const_M <- summary_RW( fe = const_fe, re = const_re, stat = "mean" ) 
+const_LQ <- summary_RW( fe = const_fe, re = const_re, stat = "q0.025" ) 
+const_UQ <- summary_RW( fe = const_fe, re = const_re, stat = "q0.975" ) 
+
+logistic_M <- summary_RW( fe = logistic_fe, re = logistic_re, stat = "mean" ) 
+logistic_LQ <- summary_RW( fe = logistic_fe, re = logistic_re, stat = "q0.025" )
+logistic_UQ <- summary_RW( fe = logistic_fe, re = logistic_re, stat = "q0.975" )
+
+quad_M <- summary_RW( fe = quad_fe, re = quad_re, stat = "mean" ) 
+quad_LQ <- summary_RW( fe = quad_fe, re = quad_re, stat = "q0.025" )
+quad_UQ <- summary_RW( fe = quad_fe, re = quad_re, stat = "q0.975" ) 
+
+const_model_column <- column_RW( const_M, const_LQ, const_UQ )
+logistic_model_column <- column_RW( logistic_M, logistic_LQ, logistic_UQ )
+quad_model_column <- column_RW( quad_M, quad_LQ, quad_UQ )
+
+Appendix_Table_SimStudy_RW( Table = cbind( const_model_column, 
+                                           logistic_model_column, 
+                                           quad_model_column ),
+                            caption = "Estimated model parameters when the air pollution 
+                            effect is fit as a 2nd-order random walk and is simulated as a 
+                            constant, logistic, and quadratic function.", 
+                            label = "SimStudy-Appendix-Table-RW2-1" )
+```
+
+
+```{r Table-SimStudy-Appendix-Fixed-Effects-1}
+const_fe <- fixed_effects_summary( const_annual_model )
+const_re <- random_effects_summary( const_annual_model )
+logistic_fe <- fixed_effects_summary( logistic_annual_model )
+logistic_re <- random_effects_summary( logistic_annual_model )
+quad_fe <- fixed_effects_summary( quad_annual_model )
+quad_re <- random_effects_summary( quad_annual_model )
+
+const_M <- summary_FE( fe = const_fe, re = const_re, stat = "mean") 
+const_LQ <- summary_FE( fe = const_fe, re = const_re, stat = "q0.025") 
+const_UQ <- summary_FE( fe = const_fe, re = const_re, stat = "q0.975") 
+
+logistic_M <- summary_FE( fe = logistic_fe, re = logistic_re, stat = "mean") 
+logistic_LQ <- summary_FE( fe = logistic_fe, re = logistic_re, stat = "q0.025")
+logistic_UQ <- summary_FE( fe = logistic_fe, re = logistic_re, stat = "q0.975")
+
+quad_M <- summary_FE( fe = quad_fe, re = quad_re, stat = "mean") 
+quad_LQ <- summary_FE( fe = quad_fe, re = quad_re, stat = "q0.025")
+quad_UQ <- summary_FE( fe = quad_fe, re = quad_re, stat = "q0.975") 
+
+const_model_column <- column_FE( const_M, const_LQ, const_UQ )
+logistic_model_column <- column_FE( logistic_M, logistic_LQ, logistic_UQ )
+quad_model_column <- column_FE( quad_M, quad_LQ, quad_UQ )
+
+Appendix_Table_SimStudy_FE( Table = cbind( const_model_column, 
+                                           logistic_model_column, 
+                                           quad_model_column ),
+                caption = "Estimated model parameters when the air pollution effect 
+                is fit as an annual interaction term and is simulated as a 
+                constant, logistic, and quadratic function.", 
+                label = "SimStudy-Appendix-Table-FE-1" )
+```
+
+
+```{r Table-SimStudy-Appendix-Random-Walk-2}
+skew_fe <- fixed_effects_summary( skew_rw_model )
+skew_re <- random_effects_summary( skew_rw_model )
+cubic_fe <- fixed_effects_summary( cubic_rw_model )
+cubic_re <- random_effects_summary( cubic_rw_model )
+step_fe <- fixed_effects_summary( step_rw_model )
+step_re <- random_effects_summary( step_rw_model )
+
+skew_M <- summary_RW( fe = skew_fe, re = skew_re, stat = "mean" ) 
+skew_LQ <- summary_RW( fe = skew_fe, re = skew_re, stat = "q0.025" ) 
+skew_UQ <- summary_RW( fe = skew_fe, re = skew_re, stat = "q0.975" ) 
+
+cubic_M <- summary_RW( fe = cubic_fe, re = cubic_re, stat = "mean" ) 
+cubic_LQ <- summary_RW( fe = cubic_fe, re = cubic_re, stat = "q0.025" )
+cubic_UQ <- summary_RW( fe = cubic_fe, re = cubic_re, stat = "q0.975" )
+
+step_M <- summary_RW( fe = step_fe, re = step_re, stat = "mean" ) 
+step_LQ <- summary_RW( fe = step_fe, re = step_re, stat = "q0.025" )
+step_UQ <- summary_RW( fe = step_fe, re = step_re, stat = "q0.975" ) 
+
+skew_model_column <- column_RW( skew_M, skew_LQ, skew_UQ )
+cubic_model_column <- column_RW( cubic_M, cubic_LQ, cubic_UQ )
+step_model_column <- column_RW( step_M, step_LQ, step_UQ )
+
+Appendix_Table_SimStudy_RW( Table = cbind( skew_model_column, 
+                                           cubic_model_column, 
+                                           step_model_column ),
+                            caption = "Estimated model parameters when air pollution is fit as a 
+                            2nd-order random walk and simulated as a skewed, cubic, and step function.", 
+                            label = "SimStudy-Appendix-Table-RW-2" )
+```
+
+```{r Table-SimStudy-Appendix-Fixed-Effects-2}
+skew_fe <- fixed_effects_summary( skew_annual_model )
+skew_re <- random_effects_summary( skew_annual_model )
+cubic_fe <- fixed_effects_summary( cubic_annual_model )
+cubic_re <- random_effects_summary( cubic_annual_model )
+step_fe <- fixed_effects_summary( step_annual_model )
+step_re <- random_effects_summary( step_annual_model )
+
+skew_M <- summary_FE( fe = skew_fe, re = skew_re, stat = "mean") 
+skew_LQ <- summary_FE( fe = skew_fe, re = skew_re, stat = "q0.025") 
+skew_UQ <- summary_FE( fe = skew_fe, re = skew_re, stat = "q0.975") 
+
+cubic_M <- summary_FE( fe = cubic_fe, re = cubic_re, stat = "mean") 
+cubic_LQ <- summary_FE( fe = cubic_fe, re = cubic_re, stat = "q0.025")
+cubic_UQ <- summary_FE( fe = cubic_fe, re = cubic_re, stat = "q0.975")
+
+step_M <- summary_FE( fe = step_fe, re = step_re, stat = "mean") 
+step_LQ <- summary_FE( fe = step_fe, re = step_re, stat = "q0.025")
+step_UQ <- summary_FE( fe = step_fe, re = step_re, stat = "q0.975") 
+
+skew_model_column <- column_FE( skew_M, skew_LQ, skew_UQ )
+cubic_model_column <- column_FE( cubic_M, cubic_LQ, cubic_UQ )
+step_model_column <- column_FE( step_M, step_LQ, step_UQ )
+
+Appendix_Table_SimStudy_FE( Table = cbind( skew_model_column, 
+                                           cubic_model_column, 
+                                           step_model_column ),
+                caption = "Estimated model parameters when air pollution is fit as an annual 
+                interaction term and is simulated as a skewed, cubic, and step function.", 
+                label = "SimStudy-Appendix-Table-FE-2" )
+```
